@@ -1,7 +1,7 @@
 import re
 
 from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured
+#from django.core.exceptions import ImproperlyConfigured
 from django.contrib.sites.models import Site
 from django.db.models import Q
 from django.db.models.query import EmptyQuerySet
@@ -26,30 +26,19 @@ try:
 except ImportError:
     from django.utils import importlib
 
-from haystack import indexes, site
+from haystack import indexes, connections
 
 from cms.models.pluginmodel import CMSPlugin
 
 from cms_search import models as proxy_models
 from cms_search import settings as search_settings
 
-def _get_index_base():
-    index_string = search_settings.INDEX_BASE_CLASS
-    module, class_name = index_string.rsplit('.', 1)
-    mod = importlib.import_module(module)
-    base_class = getattr(mod, class_name, None)
-    if not base_class:
-        raise ImproperlyConfigured('CMS_SEARCH_INDEX_BASE_CLASS: module %s has no class %s' % (module, class_name))
-    if not issubclass(base_class, indexes.SearchIndex):
-        raise ImproperlyConfigured('CMS_SEARCH_INDEX_BASE_CLASS: %s is not a subclass of haystack.indexes.SearchIndex' % search_settings.INDEX_BASE_CLASS)
-    return base_class
-
 rf = RequestFactory()
 
-def page_index_factory(language_code):
+def page_index_factory(language_code, proxy_model):
 
-    class _PageIndex(_get_index_base()):
-        _language = language_code
+    class _PageIndex(indexes.SearchIndex, indexes.Indexable):
+#        _language = language_code
         language = indexes.CharField()
 
         text = indexes.CharField(document=True, use_template=False)
@@ -62,11 +51,11 @@ def page_index_factory(language_code):
         def prepare(self, obj):
             current_languge = get_language()
             try:
-                if current_languge != self._language:
-                    activate(self._language)
+                if current_languge != language_code:
+                    activate(language_code)
                 request = rf.get("/")
                 request.session = {}
-                request.LANGUAGE_CODE = self._language
+                request.LANGUAGE_CODE = language_code
                 self.prepared_data = super(_PageIndex, self).prepare(obj)
                 plugins = CMSPlugin.objects.filter(language=language_code, placeholder__in=obj.placeholders.all())
                 text = u''
@@ -83,11 +72,14 @@ def page_index_factory(language_code):
                 text += u' '
                 text += obj.get_meta_keywords() or u''
                 self.prepared_data['text'] = text
-                self.prepared_data['language'] = self._language
+                self.prepared_data['language'] = language_code
                 return self.prepared_data
             finally:
                 if get_language() != current_languge:
                     activate(current_languge)
+
+        def get_model(self):
+            return proxy_model
 
         def index_queryset(self):
             # get the correct language and exclude pages that have a redirect
@@ -104,10 +96,15 @@ def page_index_factory(language_code):
 
     return _PageIndex
 
-for language_code, language_name in settings.LANGUAGES:
-    proxy_model = getattr(proxy_models, proxy_models.proxy_name(language_code))
-    index = page_index_factory(language_code)
-    if proxy_model:
-        site.register(proxy_model, index)
-    else:
-        print "no page proxy model found for language %s" % language_code
+# we don't want the globals() style which was used in models.py ...
+def push_indices():
+    magic_indices = []
+    for language_code, language_name in settings.LANGUAGES:
+        proxy_model = getattr(proxy_models, proxy_models.proxy_name(language_code))
+        magic_indices.append( page_index_factory(language_code, proxy_model))
+
+    unified_index = connections['default'].get_unified_index()
+    prev_indices = [index for key, index in unified_index.indexes.iteritems()]
+    all_indices = [ind() for ind in magic_indices] + prev_indices
+    unified_index.build(indexes=all_indices)
+push_indices()
